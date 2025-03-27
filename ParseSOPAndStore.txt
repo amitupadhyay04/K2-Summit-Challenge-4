@@ -1,0 +1,99 @@
+import boto3
+import json
+import re
+import docx
+import tempfile
+from botocore.exceptions import BotoCoreError, ClientError
+
+# AWS Clients
+s3_client = boto3.client("s3")
+dynamodb = boto3.resource("dynamodb")
+
+# DynamoDB Table Name
+TABLE_NAME = "SOP_Error_Resolution"
+
+def extract_text_from_docx(file_path):
+    """Extracts text from a DOCX file."""
+    doc = docx.Document(file_path)
+    text = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
+    return "\n".join(text)
+
+def clean_error_message(error_message):
+    """Removes any extra surrounding quotes in the ErrorMessage field."""
+    return error_message.strip("\"") if error_message else None
+
+def parse_sop(sop_text):
+    """Parses the SOP document text and extracts error resolution steps."""
+    error_blocks = sop_text.split("Error Type: ")[1:]  # Split the text by "Error Type"
+    parsed_data = []
+
+    for block in error_blocks:
+        lines = block.strip().split("\n")
+        error_type = lines[0].strip() if lines else None  # Extract error type
+
+        # Extract error message, lambda function ARN, and resolution steps
+        error_message = None
+        lambda_function_arn = None
+        resolution_steps = []
+
+        for line in lines[1:]:
+            if "Error Message:" in line:
+                error_message = clean_error_message(line.split("Error Message:")[1].strip())
+            elif "Lambda Function:" in line:
+                lambda_function_arn = line.split("Lambda Function:")[1].strip()
+            elif "Step" in line:
+                resolution_steps.append(line.strip())
+
+        # ✅ Debugging
+        print(f"Extracted ErrorType: {error_type}")
+        print(f"Extracted ErrorMessage: {error_message}")  # Should not have extra quotes
+        print(f"Extracted LambdaFunctionARN: {lambda_function_arn}")
+        print(f"Extracted ResolutionSteps: {resolution_steps}")
+
+        parsed_data.append({
+            "ErrorType": error_type,
+            "ErrorMessage": error_message,
+            "LambdaFunctionARN": lambda_function_arn,
+            "ResolutionSteps": resolution_steps
+        })
+
+    return parsed_data
+
+def store_in_dynamodb(error_mappings):
+    """Stores parsed SOP details into DynamoDB."""
+    table = dynamodb.Table(TABLE_NAME)
+
+    for error_data in error_mappings:
+        try:
+            table.put_item(Item=error_data)
+            print(f"✅ Stored SOP for {error_data['ErrorType']} in DynamoDB")
+        except (BotoCoreError, ClientError) as e:
+            print(f"❌ Failed to store SOP in DynamoDB: {str(e)}")
+
+def lambda_handler(event, context):
+    """Triggered by an S3 event when an SOP file is uploaded."""
+    try:
+        # Extract S3 bucket and object key from event
+        record = event["Records"][0]
+        bucket_name = record["s3"]["bucket"]["name"]
+        object_key = record["s3"]["object"]["key"]
+        
+        # Download the Word document from S3
+        with tempfile.NamedTemporaryFile(delete=False) as temp_file:
+            s3_client.download_file(bucket_name, object_key, temp_file.name)
+            sop_text = extract_text_from_docx(temp_file.name)
+
+        # Parse the SOP content
+        parsed_data = parse_sop(sop_text)
+
+        # ✅ Debugging: Print the parsed data before storing
+        print("Parsed Data:", json.dumps(parsed_data, indent=2))
+
+        # Store in DynamoDB
+        store_in_dynamodb(parsed_data)
+
+        return {"status": "success", "message": "SOP processed and stored in DynamoDB"}
+
+    except Exception as e:
+        print(f"❌ Error: {str(e)}")
+        return {"status": "failure", "message": str(e)}

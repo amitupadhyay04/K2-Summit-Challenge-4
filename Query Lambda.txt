@@ -1,0 +1,136 @@
+import json
+import boto3
+import os
+import re
+
+# Initialize AWS clients
+dynamodb = boto3.resource("dynamodb")
+lambda_client = boto3.client("lambda")
+bedrock_runtime = boto3.client("bedrock-runtime")  # For Claude 3.5 Sonnet v2
+
+# DynamoDB Table Name
+TABLE_NAME = "SOP_Error_Resolution"
+
+def extract_error_details(error_message):
+    """Extracts error type and resolution steps from DynamoDB."""
+    table = dynamodb.Table(TABLE_NAME)
+    response = table.scan()
+    
+    for item in response.get("Items", []):
+        stored_error_pattern = item.get("ErrorMessage", "")
+        pattern = re.sub(r"\{.*?\}", ".*", stored_error_pattern)
+        
+        if re.match(pattern, error_message):
+            return item["ErrorType"], item.get("ResolutionSteps", [])
+    
+    return None, []  # No match found
+
+def generate_lambda_name(error_type):
+    """Generates a meaningful Lambda function name based on the error type."""
+    return f"resolve_{error_type.lower().replace(' ', '_')}_lambda"
+
+def call_claude_for_resolution(error_type, error_message, function_name, resolution_steps):
+    """Calls Claude 3.5 Sonnet to generate a Lambda function and meaningful name."""
+    prompt = f"""
+    You are an AI assistant responsible for automatically resolving AWS CloudWatch errors using Lambda functions. Given the error logs and predefined resolution steps from DynamoDB, you must generate and deploy a Lambda function to resolve the issue.
+
+    ## **Error Details (from CloudWatch Logs)**  
+    Error Type: {error_type}  
+    Error Message: "{error_message}"  
+    Additional Context:  
+    - Function Name: {function_name}    
+
+    ## **Resolution Steps (from DynamoDB)**  
+    {resolution_steps}
+
+    Your Task:
+    1. Analyze the given error and determine the root cause.
+    2. Generate a **meaningful function name** for the Lambda function.
+    3. Generate a Python AWS Lambda function that resolves this error using the provided resolution steps.
+    4. Please don't make it task id specific make it function_name specific
+    5. Ensure the function:
+       - Implements retry logic for transient failures.
+       - Uses proper logging for debugging.
+       - Follows AWS security best practices (least privilege IAM policies, no hardcoded credentials, etc.).
+    6. Output the function name and Python code in the following format:
+    
+    Function Name: <Generated Function Name>
+    ```python
+    <Generated Lambda Code>
+    ```
+    """
+
+    response = bedrock_runtime.invoke_model(
+        modelId="2.0",
+        body=json.dumps({
+            "anthropic_version": "bedrock-2023-05-31",
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 4000
+        })
+    )
+    
+    response_body = json.loads(response['body'].read().decode('utf-8'))
+    
+    # Extract response content properly
+    if isinstance(response_body.get("content"), list):
+        extracted_text = "".join(chunk.get("text", "") for chunk in response_body["content"])
+    else:
+        extracted_text = response_body.get("content", "")
+
+    return extracted_text
+
+def extract_function_name_and_code(claude_response):
+    """Parses Claude's response to extract the function name and code."""
+    if not isinstance(claude_response, str):
+        print(f"⚠️ Unexpected Claude response type: {type(claude_response)}")
+        return None, None
+
+    function_name_match = re.search(r"Function Name:\s*(\S+)", claude_response)
+    function_name = function_name_match.group(1) if function_name_match else None
+
+    start_index = claude_response.find("```python") + 9
+    end_index = claude_response.find("```", start_index)
+    lambda_code = claude_response[start_index:end_index].strip() if start_index > 8 and end_index > start_index else None
+
+    return function_name, lambda_code
+
+def lambda_handler(event, context):
+    """Handles querying DynamoDB and sending error details to Claude for resolution."""
+    try:
+        print("Received event:", json.dumps(event, indent=4))
+
+        # Ensure event is a dictionary, not a list
+        if isinstance(event, list):
+            event = event[0]  # Extract first item from list
+
+        body = json.loads(event["body"]) if "body" in event else event
+        monitored_lambda = body.get("lambda_function", "Unknown")
+        request_id = body.get("request_id", "Unknown")
+        error_message = body.get("error_message", "Unknown")
+
+        # Query DynamoDB for matching error type
+        error_type, resolution_steps = extract_error_details(error_message)
+
+        if not error_type:
+            return {"statusCode": 404, "body": json.dumps({"error": "No matching error type found."})}
+
+        # Call Claude for Lambda function generation
+        claude_response = call_claude_for_resolution(error_type, error_message, monitored_lambda, resolution_steps)
+
+        # Extract function name and Lambda code
+        function_name, lambda_code = extract_function_name_and_code(claude_response)
+
+        if not function_name:
+            function_name = generate_lambda_name(error_type)  # Generate name if Claude didn't provide one
+
+        return {
+            "statusCode": 200,
+            "body": {
+                "claude_response": claude_response,
+                "lambda_name": function_name
+            }
+        }
+
+    except Exception as e:
+        print(f"❌ Error: {str(e)}")
+        return {"statusCode": 500, "body": json.dumps({"error": str(e)})}

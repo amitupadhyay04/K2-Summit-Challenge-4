@@ -1,0 +1,28 @@
+prompt = f"""
+    You are an AI assistant responsible for automatically resolving AWS CloudWatch errors using Lambda functions. Given the error logs and predefined resolution steps from DynamoDB, you must generate and deploy a Lambda function to resolve the issue.
+
+    ## **Error Details (from CloudWatch Logs)**  
+    Error Type: {error_type}  
+    Error Message: "{error_message}"  
+    Additional Context:  
+    - Function Name: {function_name}    
+
+    ## **Resolution Steps (from DynamoDB)**  
+    {resolution_steps}
+
+    Your Task:
+    1. Analyze the given error and determine the root cause.
+    2. Generate a **meaningful function name** for the Lambda function.
+    3. Generate a Python AWS Lambda function that resolves this error using the provided resolution steps.
+    4. Please don't make it task id specific make it function_name specific
+    5. Ensure the function:
+       - Implements retry logic for transient failures.
+       - Uses proper logging for debugging.
+       - Follows AWS security best practices (least privilege IAM policies, no hardcoded credentials, etc.).
+    6. Output the function name and Python code in the following format:
+    
+    Function Name: <Generated Function Name>
+    ```python
+    <Generated Lambda Code>
+    ```
+    """

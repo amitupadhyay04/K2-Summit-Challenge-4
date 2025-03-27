@@ -1,0 +1,63 @@
+import json
+import gzip
+import base64
+import boto3
+import os
+
+# Initialize AWS Step Functions client
+stepfunctions_client = boto3.client("stepfunctions")
+
+# Step Function ARN (Replace with your actual Step Function ARN)
+STEP_FUNCTION_ARN = "arn:aws:states:ap-south-1:rrorResolution"
+
+def lambda_handler(event, context):
+    print("Received event:", json.dumps(event))
+
+    # Decode and decompress the CloudWatch log data
+    compressed_data = base64.b64decode(event["awslogs"]["data"])
+    decompressed_data = gzip.decompress(compressed_data)
+    log_data = json.loads(decompressed_data)
+
+    # Extract log events
+    unique_errors = {}
+
+    for log_event in log_data.get("logEvents", []):
+        message = log_event.get("message", "")
+
+        if "[ERROR]" in message:
+            try:
+                # Extract JSON error details from the log message
+                error_details = json.loads(message.split("\t")[-1])
+                request_id = error_details.get("request_id")
+
+                # Store only unique errors using request_id as the key
+                if request_id not in unique_errors:
+                    unique_errors[request_id] = {
+                        "lambda_function": error_details.get("lambda"),
+                        "request_id": request_id,
+                        "task_id": error_details.get("task_id"),
+                        "error_message": error_details.get("message")
+                    }
+
+            except json.JSONDecodeError:
+                print("Failed to parse error log message:", message)
+
+    # Convert dictionary values to a list
+    extracted_errors = list(unique_errors.values())
+
+    print("Extracted unique errors:", json.dumps(extracted_errors, indent=4))
+
+    if extracted_errors:
+        first_error = extracted_errors[0]  # Send only the first error
+
+        # Trigger Step Function execution with a single JSON object
+        response = stepfunctions_client.start_execution(
+            stateMachineArn=STEP_FUNCTION_ARN,
+            input=json.dumps(first_error)  # Send as an object, not a list
+        )
+        print("Step Function started:", response)
+
+        return {
+            "statusCode": 200,
+            "body": json.dumps(first_error)  # Ensure it's a single object
+        }

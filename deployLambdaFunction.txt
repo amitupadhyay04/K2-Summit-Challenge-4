@@ -1,0 +1,127 @@
+import json 
+import boto3
+import base64
+import zipfile
+import os
+import time
+from io import BytesIO
+from botocore.exceptions import ClientError
+
+# AWS Clients
+s3_client = boto3.client('s3')
+lambda_client = boto3.client('lambda')
+
+# Constants
+S3_BUCKET_NAME = os.environ.get('S3_BUCKET_NAME', 'lambda-deployment-bucket')
+LAMBDA_ROLE_ARN = os.environ.get('LAMBDA_ROLE_ARN')
+
+
+def extract_lambda_code(response_text):
+    """Extracts Python Lambda function code from Claude's response."""
+    try:
+        start_index = response_text.find("```python") + 9
+        end_index = response_text.find("```", start_index)
+        return response_text[start_index:end_index].strip()
+    except Exception as e:
+        print(f"Error extracting code: {str(e)}")
+        return None
+
+
+def create_zip_package(lambda_code):
+    """Creates a ZIP package containing the Lambda function."""
+    zip_buffer = BytesIO()
+    
+    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+        zip_file.writestr("lambda_function.py", lambda_code)
+    
+    zip_buffer.seek(0)
+    return zip_buffer.getvalue()
+
+
+def deploy_lambda_function(lambda_name, lambda_code):
+    """Deploys the extracted Lambda function to AWS and waits until it's Active."""
+    try:
+        # Create ZIP package
+        zip_data = create_zip_package(lambda_code)
+        
+        # Upload to AWS Lambda
+        response = lambda_client.create_function(
+            FunctionName=lambda_name,
+            Runtime='python3.9',
+            Role=LAMBDA_ROLE_ARN,
+            Handler='lambda_function.lambda_handler',
+            Code={'ZipFile': zip_data},
+            Timeout=120,
+            MemorySize=256
+        )
+
+        # ✅ Wait for function to become "Active"
+        for _ in range(10):  # Retry for ~10 seconds
+            time.sleep(2)  # Wait before checking
+            try:
+                status = lambda_client.get_function(FunctionName=lambda_name)['Configuration']['State']
+                print(f"Lambda Status: {status}")
+                if status == "Active":
+                    break
+            except ClientError:
+                pass
+
+        return response
+    except ClientError as e:
+        print(f"Failed to deploy Lambda: {str(e)}")
+        return None
+
+
+def invoke_lambda_function(lambda_name):
+    """Invokes the deployed Lambda function with necessary parameters."""
+    try:
+        response = lambda_client.invoke(
+            FunctionName=lambda_name,
+            InvocationType='RequestResponse',
+            Payload=json.dumps({"functionName": lambda_name})  # ✅ Removed task_id
+        )
+
+        response_payload = json.loads(response['Payload'].read().decode('utf-8'))
+        return response_payload
+    except ClientError as e:
+        print(f"Failed to invoke Lambda: {str(e)}")
+        return {"error": f"Failed to invoke Lambda: {str(e)}"}
+    except Exception as e:
+        print(f"Unexpected error while invoking Lambda: {str(e)}")
+        return {"error": f"Unexpected error while invoking Lambda: {str(e)}"}
+
+
+def lambda_handler(event, context):
+    """Main Lambda function to deploy and execute the generated function."""
+    response_text = event.get('claude_response')
+    lambda_name = event.get('lambda_name', 'AutoResolvedLambda')
+
+    if not response_text:
+        return {'statusCode': 400, 'body': 'Missing Claude response'}
+    
+    lambda_code = extract_lambda_code(response_text)
+    print("Generated Lambda Code:", lambda_code)
+
+    if not lambda_code:
+        return {'statusCode': 500, 'body': 'Failed to extract Lambda code'}
+    
+    # Deploy the Lambda function
+    deploy_response = deploy_lambda_function(lambda_name, lambda_code)
+    
+    if not deploy_response:
+        return {'statusCode': 500, 'body': 'Lambda deployment failed'}
+
+    # Invoke the deployed Lambda function (✅ Removed task_id)
+    invoke_response = invoke_lambda_function(lambda_name)
+
+    if invoke_response:
+        return {
+            'statusCode': 200,
+            'body': f'Lambda function {lambda_name} deployed and executed successfully',
+            'invoke_response': invoke_response
+        }
+    else:
+        return {
+            'statusCode': 500,
+            'body': f'Lambda function {lambda_name} deployed, but execution failed'
+        }
